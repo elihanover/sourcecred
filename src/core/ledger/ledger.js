@@ -25,6 +25,10 @@ import {type NodeAddressT, NodeAddress} from "../graph";
 import {type TimestampMs} from "../../util/timestamp";
 import * as NullUtil from "../../util/null";
 import * as uuid from "../../util/uuid";
+import {
+  ethAddressParser,
+  type EthAddress,
+} from "../../plugins/ethereum/ethAddress";
 import {type Distribution, parser as distributionParser} from "./distribution";
 import * as G from "./grain";
 import {JsonLog} from "../../util/jsonLog";
@@ -43,8 +47,30 @@ type MutableAccount = {|
   // may not receive or transfer Grain. Accounts start inactive, and must
   // be explicitly activated.
   active: boolean,
+  // key-value store of addresses the account receives grain to
+  addresses: PayableAddressStore,
 |};
 export type Account = $ReadOnly<MutableAccount>;
+
+/**
+ * CurrencyAddress is a subset of all available EthAddresses.
+ *
+ * A currency address is the address of the token contract for an ERC20 token,
+ * or the 20 byte-length equivalent of 0x0, which is the conventional address
+ * used to represent ETH on the ethereum mainnet, or the native currency on an
+ * EVM-based sidechain see here for more details on these semantics:
+ * https://ethereum.org/en/developers/docs/intro-to-ethereum/#eth
+ */
+declare type CurrencyAddress = EthAddress;
+
+/**
+ * PayableAddressStore maps addresses of EVM-based currencies to a participant's
+ * address capable of accepting the currency. This structure exists to
+ * accomodate safe migration for grain/payout token changes. Users must verify
+ * themselves that the address they are supplying is capable of receiving their
+ * share of a grain distribution.
+ */
+declare type PayableAddressStore = Map<CurrencyAddress, EthAddress>;
 
 /**
  * The Ledger is an append-only auditable data store which tracks
@@ -210,6 +236,7 @@ export class Ledger {
       paid: G.ZERO,
       identity,
       active: false,
+      addresses: new Map(),
     });
   }
 
@@ -576,6 +603,52 @@ export class Ledger {
   }
 
   /**
+   * setPayoutAddress allows participants to set a payable address.
+   * These addresses are keyed on a specific currency, which ensures that
+   * users don't erroneously receive a grain distribution to an address that
+   * cannot handle it (such as a custodial wallet, or rigidly-designed
+   * contract) and effectively lose that reward.
+   *
+   * An address may be deleted by passing in an empty string for the
+   * `address` parameter. This is useful in case the underlying private key
+   * is compromised or the exchange hosting a custodial account is hacked.
+   */
+  setPayoutAddress(
+    id: IdentityId,
+    currency: CurrencyAddress,
+    address: EthAddress | ""
+  ): Ledger {
+    this._createAndProcessEvent({
+      type: "SET_PAYOUT_ADDRESS",
+      id,
+      currency,
+      address,
+    });
+    return this;
+  }
+  _setPayoutAddress({id, currency, address}: SetPayoutAddress) {
+    if (!this._accounts.has(id)) {
+      throw new Error(`setPayoutAddress: no identity matches id ${id}`);
+    }
+    const account = this._mutableAccount(id);
+    const currencyResult = ethAddressParser.parse(currency);
+    if (!currencyResult.ok) {
+      throw new Error(
+        `setPayoutAddress: invalid currency address: ${currency}`
+      );
+    }
+    if (address === "") {
+      account.addresses.delete(currency);
+      return;
+    }
+    const addressResult = ethAddressParser.parse(address);
+    if (!addressResult.ok) {
+      throw new Error(`setPayoutAddress: invalid payout address: ${address}`);
+    }
+    account.addresses.set(currency, address);
+  }
+
+  /**
    * Retrieve the log of all actions in the Ledger's history.
    *
    * May be used to reconstruct the Ledger after serialization.
@@ -648,6 +721,9 @@ export class Ledger {
       case "CHANGE_IDENTITY_TYPE":
         this._changeIdentityType(action);
         break;
+      case "SET_PAYOUT_ADDRESS":
+        this._setPayoutAddress(action);
+        break;
       // istanbul ignore next: unreachable per Flow
       default:
         throw new Error(`Unknown type: ${(action.type: empty)}`);
@@ -709,7 +785,8 @@ type Action =
   | ToggleActivation
   | DistributeGrain
   | TransferGrain
-  | ChangeIdentityType;
+  | ChangeIdentityType
+  | SetPayoutAddress;
 
 type CreateIdentity = {|
   +type: "CREATE_IDENTITY",
@@ -789,6 +866,14 @@ type TransferGrain = {|
   +amount: G.Grain,
   +memo: string | null,
 |};
+
+type SetPayoutAddress = {|
+  +type: "SET_PAYOUT_ADDRESS",
+  +id: IdentityId,
+  +currency: CurrencyAddress,
+  +address: EthAddress | "",
+|};
+
 const transferGrainParser: C.Parser<TransferGrain> = C.object({
   type: C.exactly(["TRANSFER_GRAIN"]),
   from: uuid.parser,
